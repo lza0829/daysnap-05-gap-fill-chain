@@ -30,8 +30,10 @@ export default function 周期快照() {
               <th>账户键</th>
               <th>营业日</th>
               <th>余额</th>
-              <th>抽取批次</th>
+              <th>开端余额</th>
+              <th>开端来源</th>
               <th>来源</th>
+              <th>抽取批次</th>
             </tr>
           </thead>
           <tbody>
@@ -40,8 +42,10 @@ export default function 周期快照() {
                 <td>{r.账户键}</td>
                 <td>{r.营业日}</td>
                 <td>{r.余额}</td>
-                <td>{r.抽取批次编号}</td>
+                <td>{r.开端余额 ?? "—"}</td>
+                <td>{r.开端来源 || "—"}</td>
                 <td>{r.来源}</td>
+                <td>{r.抽取批次编号}</td>
               </tr>
             ))}
           </tbody>

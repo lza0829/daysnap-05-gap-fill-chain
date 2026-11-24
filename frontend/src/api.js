@@ -26,6 +26,13 @@ export const api = {
   快照: (q = "") => 请求(`/快照${q}`),
   差额: (q = "") => 请求(`/差额${q}`),
   断档: () => 请求("/断档"),
+  断档处置: (q = "") => 请求(`/断档处置${q}`),
+  断档处置单户: (户, 日) =>
+    请求(`/断档处置/${encodeURIComponent(户)}/${encodeURIComponent(日)}`),
+  断档桥接: (状态 = "") => 请求(`/断档桥接${状态 ? `?状态=${encodeURIComponent(状态)}` : ""}`),
+  立桥接: (body) => 请求("/断档桥接", { method: "POST", body: JSON.stringify(body) }),
+  解桥接: (body) => 请求("/断档桥接/解除", { method: "POST", body: JSON.stringify(body) }),
+  同票补齐: (body) => 请求("/断档补齐", { method: "POST", body: JSON.stringify(body) }),
   跳变: () => 请求("/跳变"),
   旁置: () => 请求("/旁置"),
   夹具: () => 请求("/夹具"),

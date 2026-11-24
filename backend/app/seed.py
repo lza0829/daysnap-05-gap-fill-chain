@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+import threading
 
 from app.db import 连接
 
@@ -38,8 +38,12 @@ CREATE TABLE IF NOT EXISTS 周期快照 (
   抽取批次编号 TEXT NOT NULL,
   来源 TEXT NOT NULL DEFAULT '日终抽取',
   状态 TEXT NOT NULL DEFAULT '有效',
+  开端余额 INTEGER,
+  开端来源 TEXT NOT NULL DEFAULT '',
+  链内补齐 TEXT NOT NULL DEFAULT '[]',
   UNIQUE(账户键, 营业日)
 );
+CREATE INDEX IF NOT EXISTS 索引快照户日 ON 周期快照(账户键, 营业日, 状态);
 CREATE TABLE IF NOT EXISTS 回放批次 (
   编号 TEXT PRIMARY KEY,
   营业日 TEXT NOT NULL,
@@ -65,6 +69,34 @@ CREATE TABLE IF NOT EXISTS 断档记录 (
   处置 TEXT NOT NULL DEFAULT '待处理',
   时刻 TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS 索引断档户日 ON 断档记录(账户键, 缺营业日);
+CREATE TABLE IF NOT EXISTS 断档案件 (
+  案件键 TEXT PRIMARY KEY,
+  账户键 TEXT NOT NULL,
+  目标营业日 TEXT NOT NULL,
+  缺日清单 TEXT NOT NULL DEFAULT '[]',
+  锚点营业日 TEXT,
+  处置口径 TEXT NOT NULL DEFAULT '同票补齐',
+  状态 TEXT NOT NULL DEFAULT '待处置',
+  桥接凭证号 TEXT,
+  报告 TEXT NOT NULL DEFAULT '{}',
+  版本 INTEGER NOT NULL DEFAULT 0,
+  时刻 TEXT NOT NULL,
+  更新时刻 TEXT NOT NULL,
+  UNIQUE(账户键, 目标营业日)
+);
+CREATE TABLE IF NOT EXISTS 断档桥接凭证 (
+  凭证号 TEXT PRIMARY KEY,
+  账户键 TEXT NOT NULL,
+  目标营业日 TEXT NOT NULL,
+  缺日清单 TEXT NOT NULL DEFAULT '[]',
+  状态 TEXT NOT NULL DEFAULT '有效',
+  原因 TEXT NOT NULL DEFAULT '',
+  时刻 TEXT NOT NULL,
+  解除时刻 TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS 唯一有效桥接
+  ON 断档桥接凭证(账户键, 目标营业日) WHERE 状态='有效';
 CREATE TABLE IF NOT EXISTS 跳变记录 (
   编号 INTEGER PRIMARY KEY AUTOINCREMENT,
   账户键 TEXT NOT NULL,
@@ -116,33 +148,69 @@ CREATE TABLE IF NOT EXISTS 装载批次 (
     "跨日切点策略",
 ]
 
+_结构锁 = threading.Lock()
+_结构就绪 = False
 
-def 此刻() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def _迁移(conn) -> None:
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(周期快照)")}
+    for 名, 定义 in (
+        ("开端余额", "INTEGER"),
+        ("开端来源", "TEXT NOT NULL DEFAULT ''"),
+        ("链内补齐", "TEXT NOT NULL DEFAULT '[]'"),
+    ):
+        if 名 not in cols:
+            conn.execute(f"ALTER TABLE 周期快照 ADD COLUMN {名} {定义}")
+    # 旧脚手架的「记断档并继续 + 以零为开端」正是连环余额漂的毒源，
+    # 全局口径落定为同票补齐链后，把这两个遗留台参值扳到安全口径。
+    conn.execute(
+        "UPDATE 台参 SET 值='同票补齐链（禁止跨断档零开端）' "
+        "WHERE 键='缺前日策略' AND 值='以零为开端'"
+    )
+    conn.execute(
+        "UPDATE 台参 SET 值='同票补齐' WHERE 键='断档处置' AND 值='记断档并继续'"
+    )
 
 
 def 初始化库() -> None:
+    global _结构就绪
     conn = 连接()
-    conn.executescript(建表)
-    if conn.execute("SELECT COUNT(*) AS c FROM 台参").fetchone()["c"] == 0:
-        for k, v in {
-            "站名": "日镜账",
-            "骨架": "日终余额抽取→周期快照落行→变动流水回放核对→断档跳变检出→快照与回放差额清单",
-            "跳变阈值分": "0",
-            "断档处置": "记断档并继续",
-            "缺前日策略": "以零为开端",
-            "重复抽取": "盖写同日快照",
-        }.items():
-            conn.execute("INSERT INTO 台参(键, 值) VALUES (?, ?)", (k, v))
-    if conn.execute("SELECT COUNT(*) AS c FROM 账户").fetchone()["c"] == 0:
-        for 键, 名, 日 in [
-            ("户甲", "甲收单户", "2026-11-01"),
-            ("户乙", "乙结算户", "2026-11-01"),
-            ("户丙", "丙备用户", "2026-11-05"),
-        ]:
-            conn.execute(
-                "INSERT INTO 账户(账户键, 户名, 币种, 开户营业日, 状态) VALUES (?,?,?,?,?)",
-                (键, 名, "CNY", 日, "正常"),
-            )
-    conn.commit()
-    conn.close()
+    try:
+        conn.executescript(建表)
+        _迁移(conn)
+        if conn.execute("SELECT COUNT(*) AS c FROM 台参").fetchone()["c"] == 0:
+            for k, v in {
+                "站名": "日镜账",
+                "骨架": "日终余额抽取→周期快照落行→变动流水回放核对→断档跳变检出→快照与回放差额清单",
+                "跳变阈值分": "0",
+                "断档口径": "同票补齐：事务内先物化缺失日镜再抽当日，当日有效镜存在且开端来自补齐日",
+                "断档处置": "同票补齐",
+                "缺前日策略": "同票补齐链（禁止跨断档零开端）",
+                "桥接互斥": "有效桥接存时当日整拒无有效镜；桥接与当日有效镜事务级互斥",
+                "重复抽取": "盖写同日快照",
+            }.items():
+                conn.execute("INSERT INTO 台参(键, 值) VALUES (?, ?)", (k, v))
+        if conn.execute("SELECT COUNT(*) AS c FROM 账户").fetchone()["c"] == 0:
+            for 键, 名, 日 in [
+                ("户甲", "甲收单户", "2026-11-01"),
+                ("户乙", "乙结算户", "2026-11-01"),
+                ("户丙", "丙备用户", "2026-11-05"),
+            ]:
+                conn.execute(
+                    "INSERT INTO 账户(账户键, 户名, 币种, 开户营业日, 状态) VALUES (?,?,?,?,?)",
+                    (键, 名, "CNY", 日, "正常"),
+                )
+        conn.commit()
+    finally:
+        conn.close()
+    _结构就绪 = True
+
+
+def 确保结构() -> None:
+    """服务入口用的一次性建库护栏，避免直调服务/测试时漏掉 startup。"""
+    global _结构就绪
+    if _结构就绪:
+        return
+    with _结构锁:
+        if not _结构就绪:
+            初始化库()
